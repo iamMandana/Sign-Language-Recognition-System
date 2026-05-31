@@ -1,0 +1,269 @@
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers, applications
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, accuracy_score
+from tensorflow.keras.utils import to_categorical
+import matplotlib.pyplot as plt
+
+IMG_SIZE = 28
+MB_SIZE = 96
+REMOVE = [9, 25]  # J and Z
+RANDOM_STATE = 42
+
+# Correct SignMNIST letter order (after removing J and Z)
+CLASS_NAMES = [
+    'A','B','C','D','E','F','G','H','I',
+    'K','L','M','N','O','P','Q','R','S',
+    'T','U','V','W','X','Y'
+]
+
+#Load Datasets
+train_df = pd.read_csv("/content/drive/MyDrive/datasets/sign_mnist_train.csv")
+test_df  = pd.read_csv("/content/drive/MyDrive/datasets/sign_mnist_test.csv")
+
+X_train = train_df.iloc[:, 1:].values
+y_train = train_df.iloc[:, 0].values
+
+X_test = test_df.iloc[:, 1:].values
+y_test = test_df.iloc[:, 0].values
+
+print(train_df.shape, test_df.shape)
+
+train_mask = ~np.isin(y_train, REMOVE)
+test_mask  = ~np.isin(y_test, REMOVE)
+
+X_train, y_train = X_train[train_mask], y_train[train_mask]
+X_test,  y_test  = X_test[test_mask],  y_test[test_mask]
+
+unique_labels = sorted(np.unique(y_train))
+label_map = {old: new for new, old in enumerate(unique_labels)}
+
+y_train = np.array([label_map[y] for y in y_train])
+y_test  = np.array([label_map[y] for y in y_test])
+
+NUM_CLASSES = len(unique_labels)
+print("Number of classes:", NUM_CLASSES)
+
+np.save("class_names.npy", np.array(CLASS_NAMES))
+
+X_train = X_train.reshape(-1, 28, 28, 1).astype("float32")
+X_test  = X_test.reshape(-1, 28, 28, 1).astype("float32")
+
+X_tr, X_val, y_tr, y_val = train_test_split(
+    X_train, y_train,
+    test_size=0.1,
+    stratify=y_train,
+    random_state=RANDOM_STATE
+)
+
+#CNN data normalised
+X_tr_cnn  = X_tr / 255.0
+X_val_cnn = X_val / 255.0
+
+#mobilenet data (raw)
+X_tr_mb  = X_tr
+X_val_mb = X_val
+
+plt.figure(figsize=(10,4))
+
+for i in range(10):
+    idx = np.random.randint(len(X_tr))
+    plt.subplot(2,5,i+1)
+    plt.imshow(X_tr[idx].squeeze(), cmap="gray")
+    plt.title(CLASS_NAMES[y_tr[idx]])
+    plt.axis("off")
+
+plt.show()
+
+def build_cnn(num_classes):
+    inputs = keras.Input(shape=(28,28,1))
+
+    x = layers.Conv2D(32, 3, padding="same")(inputs)
+    x = layers.BatchNormalization()(x)
+    x = layers.ReLU()(x)
+    x = layers.MaxPooling2D()(x)
+
+    x = layers.Conv2D(64, 3, padding="same")(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.ReLU()(x)
+    x = layers.MaxPooling2D()(x)
+
+    x = layers.Conv2D(128, 3, padding="same")(x)
+    x = layers.ReLU()(x)
+
+    x = layers.GlobalAveragePooling2D()(x)
+    x = layers.Dense(128, activation="relu")(x)
+    x = layers.Dropout(0.4)(x)
+
+    outputs = layers.Dense(num_classes, activation="softmax")(x)
+
+    model = keras.Model(inputs, outputs)
+    model.compile(
+        optimizer=keras.optimizers.Adam(1e-3),
+        loss="sparse_categorical_crossentropy",
+        metrics=["accuracy"]
+    )
+    return model
+
+import tensorflow as tf
+from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
+
+MB_SIZE = 96
+
+def preprocess_for_mobilenet(X):
+    X = tf.convert_to_tensor(X, dtype=tf.float32)
+
+    # Resize 28x28 → 96x96
+    X = tf.image.resize(X, (MB_SIZE, MB_SIZE))
+
+    # Convert grayscale → RGB
+    X = tf.image.grayscale_to_rgb(X)
+
+    # Apply MobileNet preprocessing
+    X = preprocess_input(X)
+
+    return X
+
+def build_mobilenet(num_classes):
+
+    base = applications.MobileNetV2(
+        include_top=False,
+        weights="imagenet",
+        input_shape=(96, 96, 3)
+    )
+
+    base.trainable = False
+
+    inputs = keras.Input(shape=(96,96,3))
+    x = base(inputs, training=False)
+    x = layers.GlobalAveragePooling2D()(x)
+    x = layers.Dense(128, activation="relu")(x)
+    x = layers.Dropout(0.3)(x)
+
+    outputs = layers.Dense(num_classes, activation="softmax")(x)
+
+    model = keras.Model(inputs, outputs)
+
+    model.compile(
+        optimizer=keras.optimizers.Adam(1e-4),
+        loss="sparse_categorical_crossentropy",
+        metrics=["accuracy"]
+    )
+
+    return model
+
+#Callbacks
+callbacks = [
+    keras.callbacks.EarlyStopping(
+        monitor="val_accuracy",
+        patience=5,
+        restore_best_weights=True
+    ),
+    keras.callbacks.ReduceLROnPlateau(
+        monitor="val_loss",
+        factor=0.3,
+        patience=3,
+        min_lr=1e-5
+    )
+]
+
+#Train CNN
+cnn = build_cnn(NUM_CLASSES)
+history_cnn = cnn.fit(
+    X_tr_cnn, y_tr,
+    validation_data=(X_val_cnn, y_val),
+    epochs=15,
+    batch_size=64,
+    callbacks=callbacks
+)
+
+X_tr_mb  = preprocess_for_mobilenet(X_tr)
+X_val_mb = preprocess_for_mobilenet(X_val)
+
+print(X_tr_mb.shape)  # (N, 96, 96, 3)
+
+#train mobilenet model
+mobilenet = build_mobilenet(NUM_CLASSES)
+history_mb = mobilenet.fit(
+    X_tr_mb, y_tr,
+    validation_data=(X_val_mb, y_val),
+    epochs=15,
+    batch_size=64,
+    callbacks=callbacks
+)
+
+#save models
+cnn.save("cnn_model.keras")
+mobilenet.save("mobilenet_model.keras")
+
+print("Training complete. Models saved.")
+
+def compare_histories(history_cnn, history_mb, labels=("CNN", "MobileNet")):
+    epochs_cnn = range(1, len(history_cnn.history["accuracy"]) + 1)
+    epochs_mb  = range(1, len(history_mb.history["accuracy"]) + 1)
+
+    plt.figure(figsize=(14,8))
+
+    # -------- Accuracy --------
+    plt.subplot(2,1,1)
+    plt.plot(epochs_cnn, history_cnn.history["accuracy"],
+             label=f"{labels[0]} Train", linewidth=2)
+    plt.plot(epochs_cnn, history_cnn.history["val_accuracy"],
+             label=f"{labels[0]} Val", linestyle="--", linewidth=2)
+
+    plt.plot(epochs_mb, history_mb.history["accuracy"],
+             label=f"{labels[1]} Train", linewidth=2)
+    plt.plot(epochs_mb, history_mb.history["val_accuracy"],
+             label=f"{labels[1]} Val", linestyle="--", linewidth=2)
+
+    plt.ylabel("Accuracy")
+    plt.title("Training & Validation Accuracy Comparison")
+    plt.legend()
+    plt.grid(True)
+
+    # -------- Loss --------
+    plt.subplot(2,1,2)
+    plt.plot(epochs_cnn, history_cnn.history["loss"],
+             label=f"{labels[0]} Train", linewidth=2)
+    plt.plot(epochs_cnn, history_cnn.history["val_loss"],
+             label=f"{labels[0]} Val", linestyle="--", linewidth=2)
+
+    plt.plot(epochs_mb, history_mb.history["loss"],
+             label=f"{labels[1]} Train", linewidth=2)
+    plt.plot(epochs_mb, history_mb.history["val_loss"],
+             label=f"{labels[1]} Val", linestyle="--", linewidth=2)
+
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title("Training & Validation Loss Comparison")
+    plt.legend()
+    plt.grid(True)
+
+    plt.tight_layout()
+    plt.show()
+
+compare_histories(history_cnn, history_mb)
+
+#Evaluate Models
+target_names = CLASS_NAMES
+
+print("CNN:")
+print(classification_report(
+    y_test,
+    np.argmax(cnn.predict(X_test), axis=1),
+    target_names=target_names
+))
+
+X_test_mb = preprocess_for_mobilenet(X_test)
+
+mobilenet.predict(X_test_mb)
+
+print("MobileNet:")
+print(classification_report(
+    y_test,
+    np.argmax(mobilenet.predict(X_test_mb), axis=1),
+    target_names=target_names
+))
