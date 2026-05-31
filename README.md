@@ -14,6 +14,7 @@ Real-time American Sign Language (ASL) gesture recognition comparing **Custom CN
 ## Recognized Gestures
 
 24 static ASL letters (A-Y, excluding J and Z):
+
 A, B, C, D, E, F, G, H, I, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y
 
 
